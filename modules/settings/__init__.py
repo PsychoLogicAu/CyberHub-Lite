@@ -326,6 +326,7 @@ class SettingsModule(Module):
             "civitai.verbose",
             "network.listen_lan", "network.share_network", "network.require_auth",
             "network.allow_remote_browse",
+            "forge.api_url", "forge.enabled", "forge.output_dir",
         }
         if path not in allowed_paths:
             handler.respond_json({"error": "Setting cannot be modified through this endpoint"}, status=403); return
@@ -1207,6 +1208,23 @@ SETTINGS_BODY = r"""
     </div>
 
     <div class="settings-section">
+        <h2><span class="section-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span>Forge Connection</h2>
+        <div class="settings-row">
+            <div class="settings-label">Enable Forge API<div class="desc">Allow the viewer to send generation parameters to an external Stable Diffusion WebUI Forge instance.</div></div>
+            <label class="settings-toggle"><input type="checkbox" id="forgeEnabledInput"><span class="slider"></span></label>
+        </div>
+        <div class="settings-row col">
+            <div class="settings-label">Forge API URL<div class="desc">The base URL of your Forge WebUI API (e.g. http://192.168.1.100:7860). Must include protocol and port.</div></div>
+            <input class="settings-input wide" type="text" id="forgeApiUrl" placeholder="http://192.168.1.x:7860" onchange="saveSubPath('forge.api_url', this.value)">
+        </div>
+        <div class="settings-row col">
+            <div class="settings-label">Output directory<div class="desc">Where generated images are saved. Directory is created automatically if it doesn't exist.</div></div>
+            <input class="settings-input wide" type="text" id="forgeOutputDir" placeholder="/app/data/forge_output/" onchange="saveSubPath('forge.output_dir', this.value)">
+        </div>
+        <div class="status-line" id="forgeStatus"></div>
+    </div>
+
+    <div class="settings-section">
         <h2><span class="section-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6v5h-5"/><path d="M4 18v-5h5"/><path d="M19 11a7 7 0 0 0-12-4l-3 3"/><path d="M5 13a7 7 0 0 0 12 4l3-3"/></svg></span>Maintenance</h2>
         <div class="settings-row">
             <div class="settings-label">Restart hub<div class="desc">Applies all pending changes. The browser will reconnect automatically.</div></div>
@@ -1747,6 +1765,22 @@ function loadAll() {
         var hubVer = document.getElementById('hubVersion');
         if (hubVer) hubVer.textContent = 'v' + escHtml(s._hub_version || '1.0');
         loadCivitaiInfo();
+
+        // Forge Connection settings
+        var forge = s.forge || {};
+        var forgeEnabledEl = document.getElementById('forgeEnabledInput');
+        var forgeUrlEl = document.getElementById('forgeApiUrl');
+        var forgeDirEl = document.getElementById('forgeOutputDir');
+        if (forgeEnabledEl) {
+            forgeEnabledEl.checked = !!forge.enabled;
+            forgeEnabledEl.onchange = function() { saveSubPath('forge.enabled', this.checked); };
+        }
+        if (forgeUrlEl) {
+            forgeUrlEl.value = forge.api_url || '';
+        }
+        if (forgeDirEl) {
+            forgeDirEl.value = forge.output_dir || '/app/data/forge_output/';
+        }
 
         // Startup module dropdown — visible modules only (Settings has its own gear)
         var sel = document.getElementById('startupSelect');

@@ -1850,6 +1850,15 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .confirm-dialog .btn-delete { background:var(--red); color:#fff; border-color:var(--red); }
 .confirm-dialog .btn-delete:hover { background:#dc2626; }
 .confirm-dialog button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+/* Forge button */
+.meta-forge-btn { width:100%;background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:7px 0;cursor:pointer;font-size:13px;transition:background .15s; }
+.meta-forge-btn:hover { background:#6d28d9; }
+.meta-forge-btn:disabled { opacity:.5; cursor:not-allowed; }
+.meta-forge-status { font-size:11px; margin-top:8px; padding:6px 10px; border-radius:6px; display:none; }
+.meta-forge-status.loading { display:block; color:var(--text-dim); }
+.meta-forge-status.success { display:block; color:#4ade80; background:rgba(74,222,128,.08); }
+.meta-forge-status.error { display:block; color:#f87171; background:rgba(248,113,113,.08); }
 </style>
 </head>
 <body class="{BODY_CLASS}">
@@ -1991,6 +2000,9 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 </div>
 
 <script>
+/* Forge enabled flag (set from server) */
+window._forgeEnabled = {FORGE_ENABLED};
+
 /* Hub hamburger menu: toggle on click, close on outside-click or Esc */
 (function() {
     function init() {
@@ -2861,7 +2873,11 @@ function renderParsedMeta(parsed, info, rawMeta, civitai) {
                      '<option value="suno">Suno</option>' +
                  '</select>' +
              '</div>' +
-             '<button onclick="saveToLibrary()" style="width:100%;background:var(--accent,#4a9eff);color:#fff;border:none;border-radius:6px;padding:7px 0;cursor:pointer;font-size:13px">&#x1F4DA; Save to Prompt Library</button></div>';
+             '<button onclick="saveToLibrary()" style="width:100%;background:var(--accent,#4a9eff);color:#fff;border:none;border-radius:6px;padding:7px 0;cursor:pointer;font-size:13px;margin-bottom:8px">&#x1F4DA; Save to Prompt Library</button>' +
+             '<div class="meta-forge-wrapper" style="display:' + (parsed.prompt && window._forgeEnabled ? 'block' : 'none') + '">' +
+                 '<button class="meta-forge-btn" onclick="forgeGenerate()" type="button">&#x1F9EA; Generate with Forge</button>' +
+                 '<div class="meta-forge-status" id="metaForgeStatus"></div>' +
+             '</div></div>';
     }
     // File info
     h += '<div class="meta-section"><div class="meta-section-title">File Info</div><div class="meta-file-info">' +
@@ -3715,9 +3731,125 @@ async function saveToLibrary() {
             else { alert('Error: ' + (r.error || 'Unknown')); }
         })
         .catch(function(e) { alert('Error: ' + e); });
-}
-</script>
-</body>
+        }
+
+        function forgeGenerate() {
+            var m = window._libMeta;
+            if (!m || !m.parsed || !m.parsed.prompt) return;
+            var parsed = m.parsed;
+            var statusEl = document.getElementById('metaForgeStatus');
+            var btn = document.querySelector('.meta-forge-btn');
+            if (!statusEl) return;
+            btn.disabled = true;
+            btn.textContent = 'Generating...';
+            statusEl.className = 'meta-forge-status loading';
+            statusEl.textContent = 'Sending to Forge API...';
+
+            var st = parsed.settings || {};
+
+            // Extract width and height from Size: WxH if not available as top-level fields
+            var w = parsed.width;
+            var h = parsed.height;
+            if (!w || !h) {
+                var sizeStr = st.Size || '';
+                var sizeParts = sizeStr.split('x');
+                if (sizeParts.length === 2) {
+                    w = w || parseInt(sizeParts[0]);
+                    h = h || parseInt(sizeParts[1]);
+                }
+            }
+
+            // Use nullish coalescing (??) so that 0 is NOT treated as missing
+            // Send seed as string to preserve precision for large values (>2^53)
+            var rawSeed = st.Seed ?? parsed.seed;
+
+            // Extract sampler name and schedule type
+            // Priority: 1) st['Schedule type'] if ComfyUI parser provided it directly
+            //           2) Parse from st.Sampler munged format (e.g. "res_2s_beta")
+            //           3) parsed.sampler_name fallback
+            var rawSampler = st.Sampler ?? parsed.sampler_name;
+            var samplerName = 'Euler';
+            var scheduleType = 'Beta';
+
+            // Check if ComfyUI parser already extracted Schedule type separately
+            var explicitSchedule = st['Schedule type'];
+            if (explicitSchedule) {
+                scheduleType = explicitSchedule;
+            }
+
+            if (rawSampler) {
+                var samplerParts = rawSampler.split('_');
+                if (samplerParts.length >= 2) {
+                    samplerName = samplerParts[0];
+                    var schedPart = samplerParts.slice(1).join('_');
+                    // Capitalize first letter for Forge API (only if not already explicit)
+                    if (!explicitSchedule) {
+                        scheduleType = schedPart.charAt(0).toUpperCase() + schedPart.slice(1);
+                    }
+                } else {
+                    samplerName = rawSampler;
+                }
+            }
+
+            // Extract shift value if present
+            var shiftVal = st.Shift ?? parsed.shift;
+
+            var _stepsRaw = st.Steps ?? parsed.steps;
+            var _cfgRaw = st['CFG scale'] ?? parsed.cfg_scale;
+            var _steps = (typeof _stepsRaw === 'number') ? _stepsRaw : parseInt(_stepsRaw);
+            var _cfg = (typeof _cfgRaw === 'number') ? _cfgRaw : parseFloat(_cfgRaw);
+            var payload = {
+                prompt: parsed.prompt || '',
+                negative_prompt: parsed.negative_prompt || '',
+                steps: (isNaN(_steps) ? 20 : _steps),
+                cfg_scale: (isNaN(_cfg) ? 7.0 : _cfg),
+                seed: rawSeed != null ? String(rawSeed) : '-1',
+                sampler_name: samplerName,
+                schedule_type: scheduleType,
+                width: w ? parseInt(w) : 512,
+                height: h ? parseInt(h) : 512,
+                model: st.Model || parsed.model || ''
+            };
+
+            // Only include shift if it has a value
+            if (shiftVal) {
+                payload.shift = parseFloat(shiftVal);
+            }
+
+            // DEBUG: log exact payload sent to server
+            console.log('[FORGE DEBUG] Payload to /api/viewer/forge/generate:', JSON.stringify(payload, null, 2));
+
+            fetch('/api/viewer/forge/generate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            })
+            .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
+            .then(function(r) {
+                if (!r.ok || r.data.error) {
+                    statusEl.className = 'meta-forge-status error';
+                    statusEl.textContent = r.data.error || 'Generation failed';
+                } else {
+                    statusEl.className = 'meta-forge-status success';
+                    var savedTo = r.data.saved_to ? 'Saved to ' + r.data.saved_to : 'Generation complete.';
+                    statusEl.textContent = savedTo;
+                    // Navigate to viewer with the saved image path
+                    if (r.data.saved_to) {
+                        window.location.href = '/viewer?path=' + encodeURIComponent(r.data.saved_to);
+                    }
+                }
+            })
+            .catch(function(e) {
+                statusEl.className = 'meta-forge-status error';
+                statusEl.textContent = 'Network error: ' + e.message;
+            })
+            .finally(function() {
+                btn.disabled = false;
+                btn.textContent = '\uD83E\uDEEA Generate with Forge';
+            });
+        }
+        </script>
+        """
 </html>
 '''
 
@@ -3938,6 +4070,7 @@ class GalleryModule(Module):
             .replace("{MODULE_NAV}", module_nav)
             .replace("{FONT_LINKS}", _font_links())
             .replace("{BODY_CLASS}", theme_body_class(self.hub.settings))
+            .replace("{FORGE_ENABLED}", "true" if self.hub.settings.get_path("forge.enabled", False) else "false")
             .replace("{ACCORDION_FOLDERS}", "true" if self.setting("accordion_folders", False) else "false")
             .replace("{SKIP_DELETE_CONFIRMATION}", "true" if self.setting("skip_delete_confirmation", False) else "false")
             .replace("{HELP_OVERLAY}", HELP_OVERLAY_HTML)

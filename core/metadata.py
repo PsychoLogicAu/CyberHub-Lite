@@ -873,10 +873,183 @@ def _parse_civitai_meta(raw):
     return result
 
 
+# ─── ComfyUI Image Saver sampler unmunging ───────────────────────────────────────
+
+# ComfyUI munges sampler + schedule into one string (e.g. "res_2s_beta").
+# Forge expects them split into `Sampler` and `Schedule type` fields.
+
+# Base sampler name -> Forge display name.
+_COMFYUI_SAMPLER_MAP = {
+    "dpmpp_2m": "DPM++ 2M",
+    "dpmpp_2m_sde": "DPM++ 2M SDE",
+    "dpmpp_sde": "DPM++ SDE",
+    "dpmpp_2s": "DPM++ 2S",
+    "dpmpp_2s_ancestral": "DPM++ 2S Ancestral",
+    "dpmpp_2s_a": "DPM++ 2S Ancestral",
+    "dpmpp": "DPM++",
+    "dpm_2": "DPM-2",
+    "dpm_2_ancestral": "DPM-2 a",
+    "dpm_2_a": "DPM-2 a",
+    "euler_ancestral": "Euler a",
+    "euler_a": "Euler a",
+    "euler": "Euler",
+    "heun": "Heun",
+    "dpm_fast": "DPM fast",
+    "dpm_adaptive": "DPM adaptive",
+    "lms": "LMS",
+    "ddim": "DDIM",
+    "uni_pc": "UniPC",
+    "uni_pc_bh2": "UniPC BH2",
+    "res": "Res",
+}
+
+# Suffix -> Forge schedule type.
+_COMFYUI_SCHEDULE_MAP = {
+    "_beta": "Beta",
+    "_karras": "Karras",
+    "_sde": "SDE",
+    "_normal": "Normal",
+    "_sgm_uniform": "SGM Uniform",
+}
+
+
+def _unmunge_comfyui_sampler(raw_sampler):
+    """Split a ComfyUI munged sampler string into (Forge_sampler, Schedule_type).
+
+    Examples:
+        "res_2s_beta"       -> ("Res", "Beta")
+        "dpmpp_2m_sde"      -> ("DPM++ 2M SDE", "Beta")
+        "euler_ancestral"   -> ("Euler a", "Beta")
+        "dpmpp_sde"         -> ("DPM++ SDE", "Beta")
+        "lms"               -> ("LMS", "Beta")
+        "unknown_xyz"       -> ("Euler", "Beta")
+    """
+    if not raw_sampler:
+        return "Euler", "Beta"
+    # Try direct map first
+    base = raw_sampler.lower().strip()
+    if base in _COMFYUI_SAMPLER_MAP:
+        return _COMFYUI_SAMPLER_MAP[base], "Beta"
+    # Try stripping known schedule suffixes
+    for suffix, schedule in _COMFYUI_SCHEDULE_MAP.items():
+        if base.endswith(suffix):
+            stem = base[: -len(suffix)]
+            if stem in _COMFYUI_SAMPLER_MAP:
+                return _COMFYUI_SAMPLER_MAP[stem], schedule
+    # Last resort: try to find any partial match
+    for stem, name in _COMFYUI_SAMPLER_MAP.items():
+        if base.startswith(stem):
+            # Check for schedule suffix on the remainder
+            remainder = base[len(stem):]
+            if remainder.startswith("_") and remainder[1:]:
+                for suffix, schedule in _COMFYUI_SCHEDULE_MAP.items():
+                    if remainder == suffix:
+                        return name, schedule
+            return name, "Beta"
+    return "Euler", "Beta"
+
+
+def _is_comfyui_image_saver(raw):
+    """Detect ComfyUI Image Saver format by PROMPT: header or Version: ComfyUI."""
+    stripped = raw.strip()
+    lines = stripped.split("\n")
+    for line in lines:
+        if line.strip().upper() == "PROMPT:":
+            return True
+        if re.search(r"Version:\s*ComfyUI", line):
+            return True
+    return False
+
+
+def _parse_comfyui_image_saver(raw):
+    """Parse ComfyUI Image Saver node metadata format.
+
+    Two formats are supported:
+
+    Format A (with PROMPT: header)::
+
+        PROMPT:
+        <prompt text>
+        <END>
+        Negative prompt: <negative text>
+        Steps: N, Sampler: SAMPLER, CFG scale: X, Seed: S, Size: WxH, Model hash: H, Model: M, Version: ComfyUI
+
+    Format B (no PROMPT: header, prompt text starts directly)::
+
+        <prompt text><END>
+        Negative prompt: <negative text>
+        Steps: N, Sampler: SAMPLER, CFG scale: X, Seed: S, Size: WxH, Model hash: H, Model: M, Version: ComfyUI
+
+    Returns a dict with keys: raw, prompt, negative_prompt, settings.
+    """
+    # Strip null bytes (UTF-16 encoding artifact)
+    raw = raw.replace("\x00", "")
+    result = {"raw": raw}
+    lines = raw.strip().split("\n")
+
+    # Locate the negative prompt and settings line
+    neg_idx = -1
+    settings_idx = -1
+
+    for i, line in enumerate(lines):
+        if line.startswith("Negative prompt:"):
+            neg_idx = i
+        if line.startswith("Steps:"):
+            settings_idx = i
+
+    # Extract prompt — everything before "Negative prompt:" is the positive prompt.
+    # <END> is part of the prompt and must be retained.
+    if neg_idx > 0:
+        result["prompt"] = "\n".join(lines[:neg_idx]).strip()
+    elif settings_idx > 0:
+        result["prompt"] = "\n".join(lines[:settings_idx]).strip()
+    else:
+        result["prompt"] = raw.strip()
+
+    # Strip "PROMPT:" prefix if present
+    if result["prompt"].upper().startswith("PROMPT:"):
+        result["prompt"] = result["prompt"][len("PROMPT:"):].strip()
+
+    # Extract negative prompt
+    if neg_idx >= 0:
+        ne = settings_idx if settings_idx > neg_idx else len(lines)
+        neg_text = "\n".join(lines[neg_idx:ne]).replace("Negative prompt:", "", 1).strip()
+        if neg_text:
+            result["negative_prompt"] = neg_text
+
+    # Parse settings line
+    if settings_idx >= 0:
+        settings_text = "\n".join(lines[settings_idx:])
+        raw_settings = _split_a1111_settings(settings_text)
+
+        # Unmunge ComfyUI sampler -> Forge-compatible Sampler + Schedule type
+        sampler_raw = raw_settings.get("Sampler", "")
+        forge_sampler, schedule_type = _unmunge_comfyui_sampler(sampler_raw)
+
+        settings = {}
+        for key, value in raw_settings.items():
+            if key == "Sampler":
+                settings["Sampler"] = forge_sampler
+            elif key == "Version" and value == "ComfyUI":
+                # Skip Version: ComfyUI, we detect this format by content
+                settings["Source"] = "ComfyUI"
+            else:
+                settings[key] = value
+        settings["Schedule type"] = schedule_type
+        result["settings"] = settings
+    else:
+        result["settings"] = {}
+
+    return result
+
+
 def parse_sd_parameters(raw):
     """Parse A1111-style 'parameters' string into structured fields."""
     result = {"raw": raw}
     if not raw: return result
+    # ComfyUI Image Saver format
+    if _is_comfyui_image_saver(raw):
+        return _parse_comfyui_image_saver(raw)
     # Self-contained JSON formats (the whole blob lives in the parameters string):
     # SwarmUI, RuinedFooocus, Fooocus. Keeping them here means the raw JSON stays
     # visible in the Raw Metadata tab and is re-parsed on view.

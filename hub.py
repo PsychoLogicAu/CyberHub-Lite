@@ -115,6 +115,11 @@ class Hub:
         """Return an absolute path below the portable resources directory."""
         return os.path.join(self.resources_dir, *parts)
 
+    @property
+    def forge_output_dir(self):
+        """Return the configured Forge output directory, or None if not set."""
+        return (self.settings.get_path("forge.output_dir", "") or "").strip() or None
+
     # Convenience for older module code that called these directly
     def civitai_lookup(self, parsed):
         return self.civitai.lookup(parsed)

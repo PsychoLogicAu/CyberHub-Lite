@@ -38,6 +38,10 @@ DEFAULT_SETTINGS = {
     "civitai": {
         "models_path": "",
     },
+    "forge": {
+        "api_url": "",
+        "enabled": False,
+    },
     "modules": {},          # per-module settings dicts
 }
 

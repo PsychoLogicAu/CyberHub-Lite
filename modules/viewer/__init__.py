@@ -93,7 +93,31 @@ class ViewerModule(Module):
         return {
             "/api/viewer/analyze": self._analyze,
             "/api/viewer/rewrite": self._rewrite,
+            "/api/viewer/forge/generate": self._forge_generate,
         }
+
+    def prefix_routes(self):
+        return {"/viewer/file/": self._serve_file}
+
+    def _serve_file(self, handler, rel_path):
+        """Serve a file from an absolute path encoded in the URL.
+
+        URL pattern: /viewer/file/ABS_PATH
+        The rel_path is the URL-decoded absolute filesystem path.
+        """
+        filepath = rel_path
+        if not filepath or not os.path.isfile(filepath):
+            handler.send_error(404)
+            return
+        # Determine MIME type from extension
+        ext = os.path.splitext(filepath)[1].lower()
+        mime_map = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+            ".tiff": "image/tiff", ".tif": "image/tiff",
+        }
+        content_type = mime_map.get(ext, "application/octet-stream")
+        handler.serve_file(filepath)
 
     def _page(self, handler, qs):
         html = build_shell(
@@ -178,6 +202,159 @@ class ViewerModule(Module):
         except Exception as e:
             handler.respond_json({"error": str(e)}, status=500)
 
+    def _forge_generate(self, handler, content_len, content_type):
+        """Send current image's generation parameters to Forge API (txt2img)."""
+        import urllib.request
+        import urllib.error
+        import base64
+        import datetime
+
+        data = handler.read_body_json(content_len)
+        if data is None:
+            handler.respond_json({"error": "Invalid JSON"}, status=400)
+            return
+
+        forge_url = self.hub.settings.get_path("forge.api_url", "").strip().rstrip("/")
+        forge_enabled = self.hub.settings.get_path("forge.enabled", False)
+
+        if not forge_enabled:
+            handler.respond_json({"error": "Forge Connection is not enabled. Enable it in Settings."}, status=400)
+            return
+        if not forge_url:
+            handler.respond_json({"error": "Forge API URL is not configured. Set it in Settings."}, status=400)
+            return
+
+        prompt = data.get("prompt", "")
+        if not prompt:
+            handler.respond_json({"error": "No prompt found in image metadata"}, status=400)
+            return
+
+        # Build the Forge API payload
+        # Seed can be a large integer string from JS — parse safely
+        seed_val = data.get("seed", -1)
+        try:
+            seed_val = int(seed_val)
+        except (ValueError, TypeError):
+            seed_val = -1
+
+        # Width/height: client may send them directly or as a "Size" string
+        width = data.get("width")
+        height = data.get("height")
+        if width is None or height is None:
+            size_str = data.get("size", "")
+            if size_str:
+                size_parts = str(size_str).split("x")
+                if len(size_parts) == 2:
+                    try:
+                        width = width or int(size_parts[0])
+                        height = height or int(size_parts[1])
+                    except ValueError:
+                        pass
+
+        # Safely convert to int/float — handle keys that exist but are null in JSON
+        steps_val = data.get("steps")
+        cfg_val = data.get("cfg_scale")
+        payload = {
+            "prompt": prompt,
+            "negative_prompt": data.get("negative_prompt", ""),
+            "steps": int(steps_val) if steps_val is not None else 20,
+            "cfg_scale": float(cfg_val) if cfg_val is not None else 7.0,
+            "seed": seed_val,
+            "sampler_name": data.get("sampler_name", "Euler"),
+            "scheduler": data.get("schedule_type", "Beta"),
+            "width": int(width) if width else 512,
+            "height": int(height) if height else 512,
+            "batch_size": 1,
+        }
+
+        # Optional: shift parameter (used by newer schedulers)
+        shift = data.get("shift")
+        model = data.get("model", "")
+        if shift is not None or model:
+            if "override_settings" not in payload:
+                payload["override_settings"] = {}
+            if shift is not None:
+                try:
+                    payload["eta"] = 0.0
+                    payload["s_churn"] = 0.0
+                except (ValueError, TypeError):
+                    pass
+            if model:
+                payload["override_settings"]["sd_model_checkpoint"] = model
+
+        # DEBUG: log exact payload sent to Forge
+        import logging; _forge_logger = logging.getLogger("cyberhub.forge")
+        _forge_logger.info("Forge payload: %s", json.dumps(payload, indent=2))
+        print("[FORGE DEBUG] Payload:", json.dumps(payload, indent=2))
+
+        endpoint = f"{forge_url}/sdapi/v1/txt2img"
+        try:
+            req = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            handler.respond_json({
+                "error": f"Forge API returned HTTP {e.code}: {err_body or e.reason}",
+            }, status=502)
+            return
+        except urllib.error.URLError as e:
+            handler.respond_json({
+                "error": f"Could not connect to Forge API at {forge_url}. Check the URL and that Forge is running. ({e.reason})",
+            }, status=502)
+            return
+        except Exception as e:
+            handler.respond_json({"error": f"Error calling Forge API: {e}"}, status=500)
+            return
+
+        # Extract the generated image(s)
+        images = result.get("images", [])
+        if not images:
+            handler.respond_json({"error": "Forge API returned no images"}, status=500)
+            return
+
+        # Decode the first image
+        image_data_b64 = images[0]
+        try:
+            image_bytes = base64.b64decode(image_data_b64)
+        except Exception:
+            handler.respond_json({"error": "Failed to decode image from Forge API"}, status=500)
+            return
+
+        # Save the image to the configured Forge output directory
+        output_dir = self.hub.forge_output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"forge_gen_{ts}.png"
+        saved_path = os.path.join(output_dir, filename)
+        try:
+            with open(saved_path, "wb") as f:
+                f.write(image_bytes)
+        except Exception as e:
+            handler.respond_json({
+                "error": f"Generated image received but could not save to {output_dir}: {e}",
+                "image_b64": image_data_b64,
+            }, status=500)
+            return
+
+        handler.respond_json({
+            "ok": True,
+            "image_b64": image_data_b64,
+            "saved_to": saved_path,
+            "forge_params": result.get("parameters", {}),
+            "forge_info": result.get("info", {}),
+        })
+
 
 PAGE_BODY = r"""
 <style>
@@ -231,6 +408,13 @@ PAGE_BODY = r"""
 .vm-btn { border:1px solid var(--border); background:var(--bg-card); color:var(--text); border-radius:6px; padding:8px 12px; font:12px var(--font); cursor:pointer; }
 .vm-btn:hover { border-color:var(--accent); color:var(--text-bright); }
 .vm-btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.vm-btn.forge { background:#7c3aed; border-color:#7c3aed; color:#fff; }
+.vm-btn.forge:hover { background:#6d28d9; border-color:#6d28d9; }
+.vm-btn.forge:disabled { opacity:.5; cursor:not-allowed; }
+.vm-forge-status { font-size:11px; margin-top:8px; padding:6px 10px; border-radius:6px; display:none; }
+.vm-forge-status.loading { display:block; color:var(--text-dim); }
+.vm-forge-status.success { display:block; color:#4ade80; background:rgba(74,222,128,.08); }
+.vm-forge-status.error { display:block; color:#f87171; background:rgba(248,113,113,.08); }
 .vm-edit-error { color:#f87171; font:11px var(--mono); margin-right:auto; }
 @media (max-width: 860px) {
     .viewer-result { grid-template-columns:1fr; }
@@ -282,6 +466,10 @@ PAGE_BODY = r"""
         if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
     });
     fileInput.addEventListener('change', function() { if (this.files[0]) handleFile(this.files[0]); });
+
+    // Expose handleFile and renderMeta for external use (e.g. auto-load from ?path=)
+    window.handleFile = handleFile;
+    window.renderMeta = renderMeta;
 
     function handleFile(file) {
         if (!file) return;
@@ -374,6 +562,12 @@ PAGE_BODY = r"""
             h += '</span></div>';
             h += '<div class="vm-raw">' + escHtml(rawText) + '</div></div>';
         }
+        if (parsed.prompt) {
+            h += '<div class="vm-section"><div class="vm-title">Actions</div><div style="display:flex;gap:10px;align-items:center">';
+            h += '<button class="vm-btn forge" data-action="forge-generate" type="button">Generate with Forge</button>';
+            h += '<div class="vm-forge-status" id="forgeStatus"></div>';
+            h += '</div></div>';
+        }
         if (!parsed.prompt && !rawText) {
             if (isPng) {
                 h += '<div class="vm-section"><div class="vm-title"><span>Raw Metadata</span><span class="vm-actions"><span class="vm-action" data-action="edit">Edit</span></span></div>';
@@ -388,6 +582,122 @@ PAGE_BODY = r"""
         });
         el.querySelectorAll('[data-action="edit"]').forEach(function(btn) {
             btn.addEventListener('click', openEditor);
+        });
+        el.querySelectorAll('[data-action="forge-generate"]').forEach(function(btn) {
+            btn.addEventListener('click', function() { forgeGenerate(parsed); });
+        });
+    }
+
+    function forgeGenerate(parsed) {
+        var statusEl = document.getElementById('forgeStatus');
+        var btn = document.querySelector('[data-action="forge-generate"]');
+        if (!statusEl) return;
+        btn.disabled = true;
+        btn.textContent = 'Generating...';
+        statusEl.className = 'vm-forge-status loading';
+        statusEl.textContent = 'Sending to Forge API...';
+
+        var st = parsed.settings || {};
+
+        // Extract width and height from Size: WxH if not available as top-level fields
+        var w = parsed.width;
+        var h = parsed.height;
+        if (!w || !h) {
+            var sizeStr = st.Size || '';
+            var sizeParts = sizeStr.split('x');
+            if (sizeParts.length === 2) {
+                w = w || parseInt(sizeParts[0]);
+                h = h || parseInt(sizeParts[1]);
+            }
+        }
+
+        // Use nullish coalescing (??) so that 0 is NOT treated as missing
+        // Send seed as string to preserve precision for large values (>2^53)
+        var rawSeed = st.Seed ?? parsed.seed;
+
+        // Extract sampler name and schedule type
+        // Priority: 1) st['Schedule type'] if ComfyUI parser provided it directly
+        //           2) Parse from st.Sampler munged format (e.g. "res_2s_beta")
+        //           3) parsed.sampler_name fallback
+        var rawSampler = st.Sampler ?? parsed.sampler_name;
+        var samplerName = 'Euler';
+        var scheduleType = 'Beta';
+
+        // Check if ComfyUI parser already extracted Schedule type separately
+        var explicitSchedule = st['Schedule type'];
+        if (explicitSchedule) {
+            scheduleType = explicitSchedule;
+        }
+
+        if (rawSampler) {
+            var samplerParts = rawSampler.split('_');
+            if (samplerParts.length >= 2) {
+                samplerName = samplerParts[0];
+                var schedPart = samplerParts.slice(1).join('_');
+                // Capitalize first letter for Forge API (only if not already explicit)
+                if (!explicitSchedule) {
+                    scheduleType = schedPart.charAt(0).toUpperCase() + schedPart.slice(1);
+                }
+            } else {
+                samplerName = rawSampler;
+            }
+        }
+
+        // Extract shift value if present
+        var shiftVal = st.Shift ?? parsed.shift;
+
+        var _stepsRaw = st.Steps ?? parsed.steps;
+        var _cfgRaw = st['CFG scale'] ?? parsed.cfg_scale;
+        var _steps = (typeof _stepsRaw === 'number') ? _stepsRaw : parseInt(_stepsRaw);
+        var _cfg = (typeof _cfgRaw === 'number') ? _cfgRaw : parseFloat(_cfgRaw);
+        var payload = {
+            prompt: parsed.prompt || '',
+            negative_prompt: parsed.negative_prompt || '',
+            steps: (isNaN(_steps) ? 20 : _steps),
+            cfg_scale: (isNaN(_cfg) ? 7.0 : _cfg),
+            seed: rawSeed != null ? String(rawSeed) : '-1',
+            sampler_name: samplerName,
+            schedule_type: scheduleType,
+            width: w ? parseInt(w) : 512,
+            height: h ? parseInt(h) : 512,
+            model: st.Model || parsed.model || ''
+        };
+
+        // Only include shift if it has a value
+        if (shiftVal) {
+            payload.shift = parseFloat(shiftVal);
+        }
+
+        // DEBUG: log exact payload sent to server
+        console.log('[FORGE DEBUG] Payload to /api/viewer/forge/generate:', JSON.stringify(payload, null, 2));
+
+        fetch('/api/viewer/forge/generate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        })
+        .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
+        .then(function(r) {
+            if (!r.ok || r.data.error) {
+                statusEl.className = 'vm-forge-status error';
+                statusEl.textContent = r.data.error || 'Generation failed';
+            } else {
+                statusEl.className = 'vm-forge-status success';
+                var savedTo = r.data.saved_to ? 'Saved to ' + r.data.saved_to : 'Generation complete.';
+                statusEl.textContent = savedTo;
+                // Navigate to viewer with the saved image path
+                if (r.data.saved_to) {
+                    window.location.href = '/viewer?path=' + encodeURIComponent(r.data.saved_to);
+                }
+            }
+        })
+        .catch(function(e) {
+            statusEl.className = 'vm-forge-status error';
+            statusEl.textContent = 'Network error: ' + e.message;
+        })
+        .finally(function() {
+            btn.disabled = false;
+            btn.textContent = 'Generate with Forge';
         });
     }
 
@@ -501,6 +811,49 @@ PAGE_BODY = r"""
     document.getElementById('metaEditModal').addEventListener('click', function(e) {
         if (e.target === this) closeEditor();
     });
+})();
+
+// Auto-load image from ?path= query parameter (e.g. after Forge generation)
+(function() {
+    var params = new URLSearchParams(window.location.search);
+    var autoPath = params.get('path');
+    if (!autoPath) return;
+
+    // autoPath is already decoded by URLSearchParams; encode it once for the URL path
+    var encoded = encodeURIComponent(autoPath);
+    var imgSrc = '/viewer/file/' + encoded;
+
+    // Fetch the image as a blob, then feed it into handleFile()
+    fetch(imgSrc)
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.blob();
+        })
+        .then(function(blob) {
+            var name = autoPath.split('/').pop() || 'forge_gen.png';
+            var file = new File([blob], name, {type: blob.type || 'image/png'});
+            // Reuse the existing handleFile pipeline (exposed on window by the outer IIFE)
+            console.log('[FORGE DEBUG] Auto-loading image from Forge:', autoPath);
+            if (typeof window.handleFile === 'function') {
+                window.handleFile(file);
+            } else {
+                // Fallback: directly set image and show preview
+                console.warn('[FORGE DEBUG] handleFile not available, using fallback');
+                document.getElementById('viewerImg').src = URL.createObjectURL(file);
+                document.getElementById('viewerFileName').textContent = name;
+                document.getElementById('viewerPreview').classList.add('visible');
+                // Analyze metadata
+                var fd = new FormData(); fd.append('file', file);
+                fetch('/api/viewer/analyze', {method: 'POST', body: fd})
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        if (typeof window.renderMeta === 'function') window.renderMeta(data, file);
+                    });
+            }
+        })
+        .catch(function(e) {
+            console.error('[FORGE DEBUG] Failed to load Forge output:', autoPath, e);
+        });
 })();
 </script>
 """
