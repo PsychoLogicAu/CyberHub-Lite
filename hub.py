@@ -117,8 +117,9 @@ class Hub:
 
     @property
     def forge_output_dir(self):
-        """Return the configured Forge output directory, or None if not set."""
-        return (self.settings.get_path("forge.output_dir", "") or "").strip() or None
+        """Forge output directory — falls back to ~/CyberHub-Lite/forge_output/."""
+        path = (self.settings.get_path("forge.output_dir", "") or "").strip()
+        return path or os.path.expanduser("~/CyberHub-Lite/forge_output/")
 
     # Convenience for older module code that called these directly
     def civitai_lookup(self, parsed):
